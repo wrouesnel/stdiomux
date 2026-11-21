@@ -4,6 +4,11 @@ Many streams over one byte stream, such as an ssh session's stdin and stdout.
 
 ## Packages
 
+- The root package, `stdiomux`, runs a yamux session over a pair of pipes, such as an ssh
+  session's stdin and stdout (`NewConn`, `Client`, `Server`), and carries typed frames on
+  its streams (`FrameWriter`, `FrameReader`): a type byte, a big-endian uint32 length and a
+  payload. A stream usually starts with a frame saying what it's for. `Pipe` joins two
+  connections, half-closing each as the other finishes.
 - `yamux/`: a fork of [libp2p/go-yamux](https://github.com/libp2p/go-yamux) v5.1.0. It
   stays wire-compatible with yamux. Its changes are for interactive streams that share a
   connection with bulk transfers: a keystroke shouldn't wait behind megabytes of queued
