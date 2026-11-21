@@ -1,5 +1,22 @@
+# stdiomux
 
-### Changes from upstream
+Many streams over one byte stream, such as an ssh session's stdin and stdout.
+
+## Packages
+
+- `yamux/`: a fork of [libp2p/go-yamux](https://github.com/libp2p/go-yamux) v5.1.0. It
+  stays wire-compatible with yamux. Its changes are for interactive streams that share a
+  connection with bulk transfers: a keystroke shouldn't wait behind megabytes of queued
+  download.
+
+## Licence
+
+`yamux/` keeps upstream's licence, the Mozilla Public License 2.0 (`yamux/LICENSE`), with
+parts under the BSD licence in `yamux/LICENSE-BSD`. Everything else is under the MIT
+licence in `LICENSE`.
+
+
+## Changes from upstream in yamux
 
 Only the sender changes: either end can be stock yamux.
 
