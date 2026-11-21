@@ -91,6 +91,9 @@ type Session struct {
 
 	// sendCh is used to send messages
 	sendCh chan []byte
+	// dataCh carries data frames, each stream's one at a time, behind control frames.
+	dataCh chan dataFrame
+	pacer  pacer
 
 	// pingCh and pingCh are used to send pings and pongs
 	pongCh, pingCh chan uint32
@@ -142,6 +145,7 @@ func newSession(config *Config, conn net.Conn, client bool, readBuf int, newMemo
 		synCh:            make(chan struct{}, config.AcceptBacklog),
 		acceptCh:         make(chan *Stream, config.AcceptBacklog),
 		sendCh:           make(chan []byte, 64),
+		dataCh:           make(chan dataFrame, 256),
 		pongCh:           make(chan uint32, config.PingBacklog),
 		pingCh:           make(chan uint32),
 		recvDoneCh:       make(chan struct{}),
@@ -541,6 +545,40 @@ func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}, wai
 	}
 }
 
+// dataFrame is a stream's data frame waiting in dataCh.
+type dataFrame struct {
+	buf    []byte
+	stream *Stream
+}
+
+// sendData queues a stream's data frame. A stream has one frame queued at a time, so
+// streams take turns: a frame waits for the stream's last to be taken by the send loop.
+// It returns once the frame is queued, as upstream's sendMsg does.
+func (s *Session) sendData(str *Stream, hdr header, body []byte, deadline <-chan struct{}) error {
+	select {
+	case str.queued <- struct{}{}:
+	case <-deadline:
+		return ErrTimeout
+	case <-s.shutdownCh:
+		return s.shutdownErr
+	case <-s.sendDoneCh:
+		<-s.shutdownCh
+		return s.shutdownErr
+	}
+	buf := pool.Get(headerSize + len(body))
+	copy(buf[:headerSize], hdr[:])
+	copy(buf[headerSize:], body)
+	select {
+	case s.dataCh <- dataFrame{buf, str}:
+		return nil
+	case <-s.shutdownCh:
+	case <-s.sendDoneCh:
+		<-s.shutdownCh
+	}
+	pool.Put(buf)
+	return s.shutdownErr
+}
+
 // send is a long running goroutine that sends data
 func (s *Session) send() {
 	if err := s.sendLoop(); err != nil {
@@ -610,79 +648,117 @@ func (s *Session) sendLoop() (err error) {
 	//	writeTimeoutCh = ch
 	// }
 
+	write := func(buf []byte) error {
+		if err := extendWriteDeadline(); err != nil {
+			pool.Put(buf)
+			return err
+		}
+		_, err := writer.Write(buf)
+		pool.Put(buf)
+		if err != nil && os.IsTimeout(err) {
+			err = ErrConnectionWriteTimeout
+		}
+		return err
+	}
+	ping := func(flag uint16, id uint32) []byte {
+		buf := pool.Get(headerSize)
+		hdr := encode(typePing, flag, 0, id)
+		copy(buf, hdr[:])
+		return buf
+	}
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	var pending *dataFrame
+	var pendingBuf dataFrame
 	for {
-		// yield after processing the last message, if we've shutdown.
-		// s.sendCh is a buffered channel and Go doesn't guarantee select order.
 		select {
 		case <-s.shutdownCh:
 			return nil
 		default:
 		}
-
+		now := time.Now()
 		var buf []byte
-		// Make sure to send any pings & pongs first so they don't get stuck behind writes.
+		// Control first.
 		select {
-		case pingID := <-s.pingCh:
-			buf = pool.Get(headerSize)
-			hdr := encode(typePing, flagSYN, 0, pingID)
-			copy(buf, hdr[:])
-		case pingID := <-s.pongCh:
-			buf = pool.Get(headerSize)
-			hdr := encode(typePing, flagACK, 0, pingID)
-			copy(buf, hdr[:])
+		case id := <-s.pingCh:
+			buf = ping(flagSYN, id)
+		case id := <-s.pongCh:
+			buf = ping(flagACK, id)
+		case buf = <-s.sendCh:
 		default:
-			// Then send normal data.
+		}
+		if buf == nil && s.pacer.probeDue(now) {
+			buf = ping(flagSYN, s.pacer.probe(now))
+		}
+		if buf != nil {
+			if err := write(buf); err != nil {
+				return err
+			}
+			continue
+		}
+		if pending != nil {
+			if d := s.pacer.delay(now); d > 0 {
+				timer.Reset(d)
+				select {
+				case id := <-s.pingCh:
+					buf = ping(flagSYN, id)
+				case id := <-s.pongCh:
+					buf = ping(flagACK, id)
+				case buf = <-s.sendCh:
+				case <-timer.C:
+				case <-s.shutdownCh:
+					return nil
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				if buf != nil {
+					if err := write(buf); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			f := pending
+			pending = nil
+			<-f.stream.queued
+			s.pacer.sent(now, len(f.buf))
+			err := write(f.buf)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		var probe <-chan time.Time
+		if s.pacer.active(now) {
+			timer.Reset(probeInterval)
+			probe = timer.C
+		}
+		select {
+		case id := <-s.pingCh:
+			buf = ping(flagSYN, id)
+		case id := <-s.pongCh:
+			buf = ping(flagACK, id)
+		case buf = <-s.sendCh:
+		case pendingBuf = <-s.dataCh:
+			pending = &pendingBuf
+		case <-probe:
+		case <-s.shutdownCh:
+			return nil
+		}
+		if probe != nil && !timer.Stop() {
 			select {
-			case buf = <-s.sendCh:
-			case pingID := <-s.pingCh:
-				buf = pool.Get(headerSize)
-				hdr := encode(typePing, flagSYN, 0, pingID)
-				copy(buf, hdr[:])
-			case pingID := <-s.pongCh:
-				buf = pool.Get(headerSize)
-				hdr := encode(typePing, flagACK, 0, pingID)
-				copy(buf, hdr[:])
-			case <-s.shutdownCh:
-				return nil
-				// default:
-				//	select {
-				//	case buf = <-s.sendCh:
-				//	case <-s.shutdownCh:
-				//		return nil
-				//	case <-writeTimeoutCh:
-				//		if err := writer.Flush(); err != nil {
-				//			if os.IsTimeout(err) {
-				//				err = ErrConnectionWriteTimeout
-				//			}
-				//			return err
-				//		}
-
-				//		select {
-				//		case buf = <-s.sendCh:
-				//		case <-s.shutdownCh:
-				//			return nil
-				//		}
-
-				//		if writeTimeout != nil {
-				//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
-				//		}
-				//	}
+			case <-timer.C:
+			default:
 			}
 		}
-
-		if err := extendWriteDeadline(); err != nil {
-			pool.Put(buf)
-			return err
-		}
-
-		_, err := writer.Write(buf)
-		pool.Put(buf)
-
-		if err != nil {
-			if os.IsTimeout(err) {
-				err = ErrConnectionWriteTimeout
+		if buf != nil {
+			if err := write(buf); err != nil {
+				return err
 			}
-			return err
 		}
 	}
 }
@@ -810,6 +886,10 @@ func (s *Session) handlePing(hdr header) error {
 	}
 
 	// Handle a response
+	if pingID&probePing != 0 {
+		s.pacer.answered(time.Now())
+		return nil
+	}
 	s.pingLock.Lock()
 	// If we have an active ping, and this is a response to that active
 	// ping, complete the ping.

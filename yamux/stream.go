@@ -48,6 +48,10 @@ type Stream struct {
 
 	recvNotifyCh chan struct{}
 	sendNotifyCh chan struct{}
+	// queued holds a token while the stream has a data frame waiting for the send loop.
+	queued    chan struct{}
+	sendGen   uint64
+	sendState atomic.Uint64
 
 	readDeadline, writeDeadline pipeDeadline
 }
@@ -71,6 +75,7 @@ func newStream(session *Session, id uint32, state streamState, initialWindow uin
 		epochStart:   time.Now(),
 		recvNotifyCh: make(chan struct{}, 1),
 		sendNotifyCh: make(chan struct{}, 1),
+		queued:       make(chan struct{}, 1),
 	}
 	return s
 }
@@ -178,11 +183,11 @@ START:
 	flags = s.sendFlags()
 
 	// Send up to min(message, window
-	max = min(window, s.session.config.MaxMessageSize-headerSize, uint32(len(b)))
+	max = min(window, s.session.config.MaxMessageSize-headerSize, s.session.pacer.frameLimit(), uint32(len(b)))
 
 	// Send the header
 	hdr = encode(typeData, flags, s.id, max)
-	if err = s.session.sendMsg(hdr, b[:max], s.writeDeadline.wait(), true); err != nil {
+	if err = s.session.sendData(s, hdr, b[:max], s.writeDeadline.wait()); err != nil {
 		return 0, err
 	}
 
@@ -246,6 +251,17 @@ func (s *Stream) sendWindowUpdate(deadline <-chan struct{}) error {
 
 // sendClose is used to send a FIN
 func (s *Stream) sendClose() error {
+	// The FIN mustn't overtake the stream's last data frame. Once the send loop has taken
+	// that, it writes it before any control frame.
+	select {
+	case s.queued <- struct{}{}:
+		defer func() { <-s.queued }()
+	case <-s.session.shutdownCh:
+		return s.session.shutdownErr
+	case <-s.session.sendDoneCh:
+		<-s.session.shutdownCh
+		return s.session.shutdownErr
+	}
 	flags := s.sendFlags()
 	flags |= flagFIN
 	hdr := encode(typeWindowUpdate, flags, s.id, 0)
@@ -462,6 +478,7 @@ func (s *Stream) incrSendWindow(hdr header, flags uint16) {
 	s.processFlags(hdr, flags)
 	// Increase window, unblock a sender
 	atomic.AddUint32(&s.sendWindow, hdr.Length())
+	s.session.pacer.credited.Add(int64(hdr.Length()))
 	asyncNotify(s.sendNotifyCh)
 }
 
