@@ -24,9 +24,14 @@ Only the sender changes: either end can be stock yamux.
   resets), which go first. Each stream has one data frame queued at a time, so streams
   take turns rather than queueing behind each other's backlog. A stream's FIN waits for
   its data.
-- Data frames are sized to take about 5 ms to deliver at the measured rate: 4 KB up to
-  `MaxMessageSize`, 16 KB until it's measured.
-- While data flows, the session pings every 20 ms, with IDs that have the top bit set,
-  to watch for a queue building in the connection beneath it. When the queueing delay
-  goes over 5 ms, it paces data to 80% of the delivery rate measured from window
-  updates. Pacing eases off when the queue drains.
+- Data frames are sized to take about 5 ms to deliver at the measured rate: from 4 KB up
+  to `MaxMessageSize`, and 16 KB until the rate has been measured.
+- While data flows, the session pings about every 20 ms, with IDs that have the top bit
+  set. A reply shows how long the ping queued in the connection beneath, and that
+  everything written before it has been delivered, which gives the delivery rate. When
+  the queueing delay goes over 10 ms, data is paced to 90% of the delivery rate until
+  the queue drains, then at the delivery rate, rising 5% a ping while no queue builds.
+
+On a 10 Mbit link, with another stream downloading, a stream's round trip takes 11-22 ms
+against 160-210 ms with stock yamux. Downloads lose 1-5% at 10 Mbit and about 6% at
+100 Mbit with 25 ms of delay each way.

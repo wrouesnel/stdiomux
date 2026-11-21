@@ -478,7 +478,6 @@ func (s *Stream) incrSendWindow(hdr header, flags uint16) {
 	s.processFlags(hdr, flags)
 	// Increase window, unblock a sender
 	atomic.AddUint32(&s.sendWindow, hdr.Length())
-	s.session.pacer.credited.Add(int64(hdr.Length()))
 	asyncNotify(s.sendNotifyCh)
 }
 

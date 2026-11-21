@@ -653,8 +653,9 @@ func (s *Session) sendLoop() (err error) {
 			pool.Put(buf)
 			return err
 		}
-		_, err := writer.Write(buf)
+		n, err := writer.Write(buf)
 		pool.Put(buf)
+		s.pacer.written.Add(int64(n))
 		if err != nil && os.IsTimeout(err) {
 			err = ErrConnectionWriteTimeout
 		}
