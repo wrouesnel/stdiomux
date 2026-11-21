@@ -1,4 +1,4 @@
-module github.com/libp2p/go-yamux/v5
+module github.com/wrouesnel/stdiomux
 
 go 1.23
 
